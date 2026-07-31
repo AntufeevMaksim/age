@@ -29,10 +29,11 @@
 #include "utils/agtype.h"
 #include "utils/datum.h"
 #include "utils/builtins.h"
+#include "utils/agtype_traversal.h"
 
 static agtype *agtype_concat_impl(agtype *agt1, agtype *agt2);
-static agtype_value *iterator_concat(agtype_iterator **it1,
-                                     agtype_iterator **it2,
+static agtype_value *iterator_concat(agtype_traversal *it1,
+                                     agtype_traversal *it2,
                                      agtype_parse_state **state);
 static void concat_to_agtype_string(agtype_value *result, char *lhs, int llen,
                                     char *rhs, int rlen);
@@ -276,7 +277,7 @@ Datum agtype_any_add(PG_FUNCTION_ARGS)
 static agtype *delete_from_array(agtype *agt, agtype *indexes)
 {
     agtype_parse_state *state = NULL;
-    agtype_iterator *it, *it_indexes = NULL;
+    agtype_traversal it, it_indexes;
     uint32 i = 0, n;
     agtype_value v, *res = NULL;
     agtype_iterator_token r;
@@ -296,7 +297,7 @@ static agtype *delete_from_array(agtype *agt, agtype *indexes)
     }
 
     /* start buidiling the result agtype array */
-    it = agtype_iterator_init(&agt->root);
+    agtype_traversal_init(&agt->root, &it);
 
     r = agtype_iterator_next(&it, &v, false);
     Assert(r == WAGT_BEGIN_ARRAY);
@@ -318,7 +319,7 @@ static agtype *delete_from_array(agtype *agt, agtype *indexes)
              */
             agtype_value cur_idx, neg_idx;
             agtype *cur_idx_agt, *neg_idx_agt;
-            agtype_iterator *it_cur_idx, *it_neg_idx;
+            agtype_traversal it_cur_idx, it_neg_idx;
             bool contains_idx, contains_neg_idx;
 
             cur_idx.type = AGTV_INTEGER;
@@ -329,14 +330,14 @@ static agtype *delete_from_array(agtype *agt, agtype *indexes)
             neg_idx.val.int_value = cur_idx.val.int_value - n;
             neg_idx_agt = agtype_value_to_agtype(&neg_idx);
 
-            it_cur_idx = agtype_iterator_init(&cur_idx_agt->root);
-            it_neg_idx = agtype_iterator_init(&neg_idx_agt->root);
+            agtype_traversal_init(&cur_idx_agt->root, &it_cur_idx);
+            agtype_traversal_init(&neg_idx_agt->root, &it_neg_idx);
 
-            it_indexes = agtype_iterator_init(&indexes->root);
+            agtype_traversal_init(&indexes->root, &it_indexes);
             contains_idx = agtype_deep_contains(&it_indexes, &it_cur_idx, false);
 
             /* re-initialize indexes array iterator */
-            it_indexes = agtype_iterator_init(&indexes->root);
+            agtype_traversal_init(&indexes->root, &it_indexes);
             contains_neg_idx = agtype_deep_contains(&it_indexes, &it_neg_idx, false);
 
             if (contains_idx || contains_neg_idx)
@@ -360,7 +361,7 @@ static agtype *delete_from_array(agtype *agt, agtype *indexes)
 static agtype *delete_from_object(agtype *agt, char *keyptr, int keylen)
 {
     agtype_parse_state *state = NULL;
-    agtype_iterator *it;
+    agtype_traversal traversal;
     agtype_value v, *res = NULL;
     bool skipNested = false;
     agtype_iterator_token r;
@@ -378,9 +379,9 @@ static agtype *delete_from_object(agtype *agt, char *keyptr, int keylen)
         return agt;
     }
 
-    it = agtype_iterator_init(&agt->root);
+    agtype_traversal_init(&agt->root, &traversal);
 
-    while ((r = agtype_iterator_next(&it, &v, skipNested)) != WAGT_DONE)
+    while ((r = agtype_iterator_next(&traversal, &v, skipNested)) != WAGT_DONE)
     {
         skipNested = true;
 
@@ -396,7 +397,7 @@ static agtype *delete_from_object(agtype *agt, char *keyptr, int keylen)
             /* skip corresponding value as well */
             if (r == WAGT_KEY)
             {
-                (void) agtype_iterator_next(&it, &v, true);
+                (void) agtype_iterator_next(&traversal, &v, true);
             }
 
             continue;
@@ -434,16 +435,18 @@ Datum agtype_sub(PG_FUNCTION_ARGS)
      */
     if (AGT_ROOT_IS_ARRAY(rhs) && !AGT_ROOT_IS_SCALAR(rhs))
     {
+        agtype_traversal traversal;
         agtype_iterator *it = NULL;
         agtype_value elem;
 
+        traversal.it = NULL;
         if (AGT_ROOT_IS_OBJECT(lhs))
         {
             /*
              * if rhs array contains any non-string element, error out
              * else delete the given keys in the rhs array from lhs object
              */
-            while ((it = get_next_list_element(it, &rhs->root, &elem)))
+            while ((it = get_next_list_element(&traversal, &rhs->root, &elem)))
             {
                 if (elem.type == AGTV_STRING)
                 {
@@ -466,7 +469,7 @@ Datum agtype_sub(PG_FUNCTION_ARGS)
              * else delete the values at the given indexes in rhs array
              * from the lhs array
              */
-            while ((it = get_next_list_element(it, &rhs->root, &elem)))
+            while ((it = get_next_list_element(&traversal, &rhs->root, &elem)))
             {
                 if (elem.type != AGTV_INTEGER)
                 {
@@ -1363,6 +1366,9 @@ Datum agtype_exists_any_agtype(PG_FUNCTION_ARGS)
     agtype *keys = AG_GET_ARG_AGTYPE_P(1);
     agtype_value elem;
     agtype_iterator *it = NULL;
+    agtype_traversal traversal;
+
+    traversal.it = NULL;
 
     if (AGT_ROOT_IS_SCALAR(agt))
     {
@@ -1371,7 +1377,7 @@ Datum agtype_exists_any_agtype(PG_FUNCTION_ARGS)
 
     if (!AGT_ROOT_IS_SCALAR(keys) && !AGT_ROOT_IS_OBJECT(keys))
     {
-        while ((it = get_next_list_element(it, &keys->root, &elem)))
+        while ((it = get_next_list_element(&traversal, &keys->root, &elem)))
         {
             if (IS_A_AGTYPE_SCALAR(&elem))
             {
@@ -1418,6 +1424,9 @@ Datum agtype_exists_all_agtype(PG_FUNCTION_ARGS)
     agtype *keys = AG_GET_ARG_AGTYPE_P(1);
     agtype_value elem;
     agtype_iterator *it = NULL;
+    agtype_traversal traversal;
+
+    traversal.it = NULL;
 
     if (AGT_ROOT_IS_SCALAR(agt))
     {
@@ -1426,7 +1435,7 @@ Datum agtype_exists_all_agtype(PG_FUNCTION_ARGS)
 
     if (!AGT_ROOT_IS_SCALAR(keys) && !AGT_ROOT_IS_OBJECT(keys))
     {
-        while ((it = get_next_list_element(it, &keys->root, &elem)))
+        while ((it = get_next_list_element(&traversal, &keys->root, &elem)))
         {
             if (IS_A_AGTYPE_SCALAR(&elem))
             {
@@ -1476,8 +1485,10 @@ PG_FUNCTION_INFO_V1(agtype_contains);
  */
 Datum agtype_contains(PG_FUNCTION_ARGS)
 {
-    agtype_iterator *constraint_it = NULL;
-    agtype_iterator *property_it = NULL;
+
+    agtype_traversal constraint_traversal;
+    agtype_traversal property_traversal;
+
     agtype *properties = NULL;
     agtype *constraints = NULL;
 
@@ -1510,10 +1521,10 @@ Datum agtype_contains(PG_FUNCTION_ARGS)
         PG_RETURN_BOOL(false);
     }
 
-    property_it = agtype_iterator_init(&properties->root);
-    constraint_it = agtype_iterator_init(&constraints->root);
+    agtype_traversal_init(&properties->root, &property_traversal);
+    agtype_traversal_init(&constraints->root, &constraint_traversal);
 
-    PG_RETURN_BOOL(agtype_deep_contains(&property_it, &constraint_it, false));
+    PG_RETURN_BOOL(agtype_deep_contains(&property_traversal, &constraint_traversal, false));
 }
 
 PG_FUNCTION_INFO_V1(agtype_contained_by_top_level);
@@ -1525,7 +1536,7 @@ PG_FUNCTION_INFO_V1(agtype_contained_by_top_level);
  */
 Datum agtype_contained_by_top_level(PG_FUNCTION_ARGS)
 {
-    agtype_iterator *constraint_it, *property_it;
+    agtype_traversal constraint_it, property_it;
     agtype *properties, *constraints;
 
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
@@ -1552,8 +1563,8 @@ Datum agtype_contained_by_top_level(PG_FUNCTION_ARGS)
                                                              false));
     }
 
-    constraint_it = agtype_iterator_init(&constraints->root);
-    property_it = agtype_iterator_init(&properties->root);
+    agtype_traversal_init(&constraints->root, &constraint_it);
+    agtype_traversal_init(&properties->root, &property_it);
 
     PG_RETURN_BOOL(agtype_deep_contains(&constraint_it, &property_it, true));
 }
@@ -1566,7 +1577,7 @@ PG_FUNCTION_INFO_V1(agtype_contained_by);
  */
 Datum agtype_contained_by(PG_FUNCTION_ARGS)
 {
-    agtype_iterator *constraint_it, *property_it;
+    agtype_traversal constraint_it, property_it;
     agtype *properties, *constraints;
 
     if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
@@ -1593,8 +1604,8 @@ Datum agtype_contained_by(PG_FUNCTION_ARGS)
                                                              false));
     }
 
-    constraint_it = agtype_iterator_init(&constraints->root);
-    property_it = agtype_iterator_init(&properties->root);
+    agtype_traversal_init(&constraints->root, &constraint_it);
+    agtype_traversal_init(&properties->root, &property_it);
 
     PG_RETURN_BOOL(agtype_deep_contains(&constraint_it, &property_it, false));
 }
@@ -1608,8 +1619,8 @@ PG_FUNCTION_INFO_V1(agtype_contains_top_level);
  */
 Datum agtype_contains_top_level(PG_FUNCTION_ARGS)
 {
-    agtype_iterator *constraint_it = NULL;
-    agtype_iterator *property_it = NULL;
+    agtype_traversal constraint_it;
+    agtype_traversal property_it;
     agtype *properties = NULL;
     agtype *constraints = NULL;
 
@@ -1642,8 +1653,8 @@ Datum agtype_contains_top_level(PG_FUNCTION_ARGS)
         PG_RETURN_BOOL(false);
     }
 
-    property_it = agtype_iterator_init(&properties->root);
-    constraint_it = agtype_iterator_init(&constraints->root);
+    agtype_traversal_init(&properties->root, &property_it);
+    agtype_traversal_init(&constraints->root, &constraint_it);
 
     PG_RETURN_BOOL(agtype_deep_contains(&property_it, &constraint_it, true));
 }
@@ -1781,8 +1792,8 @@ static agtype *agtype_concat_impl(agtype *agt1, agtype *agt2)
 {
     agtype_parse_state *state = NULL;
     agtype_value *res;
-    agtype_iterator *it1;
-    agtype_iterator *it2;
+    agtype_traversal it1;
+    agtype_traversal it2;
 
     /*
      * If one of the agtype is empty, just return the other if it's not scalar
@@ -1802,8 +1813,8 @@ static agtype *agtype_concat_impl(agtype *agt1, agtype *agt2)
         }
     }
 
-    it1 = agtype_iterator_init(&agt1->root);
-    it2 = agtype_iterator_init(&agt2->root);
+    agtype_traversal_init(&agt1->root, &it1);
+    agtype_traversal_init(&agt2->root, &it2);
 
     res = iterator_concat(&it1, &it2, &state);
 
@@ -1819,8 +1830,8 @@ static agtype *agtype_concat_impl(agtype *agt1, agtype *agt2)
  * In that case we just append the content of it2 to it1 without any
  * verifications.
  */
-static agtype_value *iterator_concat(agtype_iterator **it1,
-                                     agtype_iterator **it2,
+static agtype_value *iterator_concat(agtype_traversal *it1,
+                                     agtype_traversal *it2,
                                      agtype_parse_state **state)
 {
     agtype_value v1, v2, *res = NULL;
@@ -1882,13 +1893,13 @@ static agtype_value *iterator_concat(agtype_iterator **it1,
         res = push_agtype_value(state, WAGT_END_ARRAY, NULL);
     }
     /* have we got array || object or object || array? */
-    else if (((rk1 == WAGT_BEGIN_ARRAY && !(*it1)->is_scalar) &&
+    else if (((rk1 == WAGT_BEGIN_ARRAY && !it1->it->is_scalar) &&
               rk2 == WAGT_BEGIN_OBJECT) ||
              (rk1 == WAGT_BEGIN_OBJECT &&
-              (rk2 == WAGT_BEGIN_ARRAY && !(*it2)->is_scalar)))
+              (rk2 == WAGT_BEGIN_ARRAY && !it2->it->is_scalar)))
     {
-        agtype_iterator **it_array = rk1 == WAGT_BEGIN_ARRAY ? it1 : it2;
-        agtype_iterator **it_object = rk1 == WAGT_BEGIN_OBJECT ? it1 : it2;
+        agtype_traversal *array_traversal = rk1 == WAGT_BEGIN_ARRAY ? it1 : it2;
+        agtype_traversal *object_traversal = rk1 == WAGT_BEGIN_OBJECT ? it1 : it2;
 
         bool prepend = (rk1 == WAGT_BEGIN_OBJECT);
 
@@ -1898,7 +1909,7 @@ static agtype_value *iterator_concat(agtype_iterator **it1,
         {
             push_agtype_value(state, WAGT_BEGIN_OBJECT, NULL);
 
-            while ((r1 = agtype_iterator_next(it_object, &v1, true)) !=
+            while ((r1 = agtype_iterator_next(object_traversal, &v1, true)) !=
                     WAGT_END_OBJECT)
             {
                 Assert(r1 == WAGT_KEY || r1 == WAGT_VALUE);
@@ -1907,7 +1918,7 @@ static agtype_value *iterator_concat(agtype_iterator **it1,
 
             push_agtype_value(state, WAGT_END_OBJECT, NULL);
 
-            while ((r2 = agtype_iterator_next(it_array, &v2, true)) !=
+            while ((r2 = agtype_iterator_next(array_traversal, &v2, true)) !=
                     WAGT_END_ARRAY)
             {
                 Assert(r2 == WAGT_ELEM);
@@ -1918,7 +1929,7 @@ static agtype_value *iterator_concat(agtype_iterator **it1,
         }
         else
         {
-            while ((r1 = agtype_iterator_next(it_array, &v1, true)) !=
+            while ((r1 = agtype_iterator_next(array_traversal, &v1, true)) !=
                    WAGT_END_ARRAY)
             {
                 Assert(r1 == WAGT_ELEM);
@@ -1927,7 +1938,7 @@ static agtype_value *iterator_concat(agtype_iterator **it1,
 
             push_agtype_value(state, WAGT_BEGIN_OBJECT, NULL);
 
-            while ((r2 = agtype_iterator_next(it_object, &v2, true)) !=
+            while ((r2 = agtype_iterator_next(object_traversal, &v2, true)) !=
                     WAGT_END_OBJECT)
             {
                 Assert(r2 == WAGT_KEY || r2 == WAGT_VALUE);
@@ -2201,11 +2212,12 @@ static Datum get_agtype_path_all(FunctionCallInfo fcinfo, bool as_text)
         if (agtvp->type == AGTV_BINARY)
         {
             agtype_iterator_token r;
-            agtype_iterator *it =
-                agtype_iterator_init((agtype_container *)
-                                      agtvp->val.binary.data);
+            agtype_traversal traversal;
 
-            r = agtype_iterator_next(&it, &tv, true);
+                agtype_traversal_init((agtype_container *)
+                                      agtvp->val.binary.data, &traversal);
+
+            r = agtype_iterator_next(&traversal, &tv, true);
             container = (agtype_container *) agtvp->val.binary.data;
             have_object = r == WAGT_BEGIN_OBJECT;
             have_array = r == WAGT_BEGIN_ARRAY;
