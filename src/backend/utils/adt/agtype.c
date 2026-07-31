@@ -4162,7 +4162,7 @@ static int extract_variadic_args_min(FunctionCallInfo fcinfo,
                           &args_res, &nulls_res, &nargs);
 
         /* All the elements of the array have the same type */
-        types_res = (Oid *) palloc0(nargs * sizeof(Oid));
+        types_res = (Oid *) palloc(nargs * sizeof(Oid));
         for (i = 0; i < nargs; i++)
         {
             types_res[i] = element_type;
@@ -4181,9 +4181,9 @@ static int extract_variadic_args_min(FunctionCallInfo fcinfo,
         }
 
         /* allocate result memory */
-        nulls_res = (bool *) palloc0(nargs * sizeof(bool));
-        args_res = (Datum *) palloc0(nargs * sizeof(Datum));
-        types_res = (Oid *) palloc0(nargs * sizeof(Oid));
+        nulls_res = (bool *) palloc(nargs * sizeof(bool));
+        args_res = (Datum *) palloc(nargs * sizeof(Datum));
+        types_res = (Oid *) palloc(nargs * sizeof(Oid));
 
         for (i = 0; i < nargs; i++)
         {
