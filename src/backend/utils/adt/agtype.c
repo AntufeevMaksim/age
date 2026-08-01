@@ -98,6 +98,18 @@ typedef enum /* type categories for datum_to_agtype */
     AGT_TYPE_OTHER /* all else */
 } agt_type_category;
 
+typedef struct agtype_type_cache
+{
+    int nargs;
+
+    Oid *types;
+
+    /* Result of agtype_categorize_type() */
+    agt_type_category *categories;
+    Oid *outfuncoids;
+} agtype_type_cache;
+
+
 static inline Datum agtype_from_cstring(char *str, int len);
 size_t check_string_length(size_t len);
 static void agtype_in_agtype_annotation(void *pstate, char *annotation);
@@ -2856,6 +2868,93 @@ Datum edge_to_jsonb(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(result);
 }
 
+static agtype_type_cache *
+get_type_cache(FunctionCallInfo fcinfo, int nargs, Oid *types)
+{
+    FmgrInfo *flinfo = fcinfo->flinfo;
+    agtype_type_cache *cache;
+    MemoryContext oldctx;
+    int i;
+    bool rebuild = false;
+
+    cache = (agtype_type_cache *)flinfo->fn_extra;
+
+    if (cache == NULL)
+    {
+        oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
+
+        cache = palloc(sizeof(agtype_type_cache));
+
+        cache->nargs = nargs;
+        cache->types = palloc(sizeof(Oid) * nargs);
+        cache->categories = palloc(sizeof(agt_type_category) * nargs);
+        cache->outfuncoids = palloc(sizeof(Oid) * nargs);
+
+        flinfo->fn_extra = cache;
+
+        MemoryContextSwitchTo(oldctx);
+
+        rebuild = true;
+    }
+    else if (cache->nargs != nargs)
+    {
+        rebuild = true;
+    }
+    else
+    {
+        for (i = 0; i < nargs; i++)
+        {
+            if (cache->types[i] != types[i])
+            {
+                rebuild = true;
+                break;
+            }
+        }
+    }
+
+    if (rebuild)
+    {
+        if (cache->nargs != nargs)
+        {
+            oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
+
+            cache->types =
+                repalloc(cache->types, sizeof(Oid) * nargs);
+
+            cache->categories =
+                repalloc(cache->categories,
+                         sizeof(agt_type_category) * nargs);
+
+            cache->outfuncoids =
+                repalloc(cache->outfuncoids,
+                         sizeof(Oid) * nargs);
+
+            cache->nargs = nargs;
+
+            MemoryContextSwitchTo(oldctx);
+        }
+
+        for (i = 0; i < nargs; i++)
+        {
+            cache->types[i] = types[i];
+
+            if (types[i] == InvalidOid)
+            {
+                cache->categories[i] = AGT_TYPE_NULL;
+                cache->outfuncoids[i] = InvalidOid;
+            }
+            else
+            {
+                agtype_categorize_type(types[i],
+                                       &cache->categories[i],
+                                       &cache->outfuncoids[i]);
+            }
+        }
+    }
+
+    return cache;
+}
+
 static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
 {
     int nargs;
@@ -2864,10 +2963,14 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
     Datum *args;
     bool *nulls;
     Oid *types;
+    agtype_type_cache *cache;
+
 
     /* build argument values to build the object */
     nargs = extract_variadic_args(fcinfo, 0, true, &args, &types, &nulls);
 
+    cache = get_type_cache(fcinfo, nargs, types);
+    
     if (nargs < 0)
     {
         return NULL;
@@ -2923,11 +3026,25 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
         }
         else
         {
-            add_agtype(args[i], false, &result, types[i], true);
+            datum_to_agtype(args[i],
+                            false,
+                            &result,
+                            cache->categories[i],
+                            cache->outfuncoids[i],
+                            true);
         }
 
         /* process value */
-        add_agtype(args[i + 1], nulls[i + 1], &result, types[i + 1], false);
+        datum_to_agtype(args[i + 1],
+                        nulls[i + 1],
+                        &result,
+                        nulls[i + 1]
+                            ? AGT_TYPE_NULL
+                            : cache->categories[i + 1],
+                        nulls[i + 1]
+                            ? InvalidOid
+                            : cache->outfuncoids[i + 1],
+                        false);
     }
 
     result.res = push_agtype_value(&result.parse_state, WAGT_END_OBJECT, NULL);
