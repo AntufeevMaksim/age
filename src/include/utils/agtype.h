@@ -548,7 +548,6 @@ typedef struct agtype_iterator
     /* Private state */
     agt_iterator_state state;
 
-    struct agtype_iterator *parent;
 } agtype_iterator;
 
 /* agtype parse state */

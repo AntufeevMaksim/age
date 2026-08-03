@@ -20,9 +20,8 @@ typedef struct AgtypeIteratorChunk
     int capacity;
     int used;
 
-    bool owned;
-
     struct AgtypeIteratorChunk *prev;
+    struct AgtypeIteratorChunk *next;
 } AgtypeIteratorChunk;
 
 typedef struct AgtypeIteratorStack

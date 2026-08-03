@@ -87,7 +87,6 @@ static void copy_to_buffer(StringInfo buffer, int offset, const char *data,
                            int len);
 
 static void iterator_from_container(agtype_container *container,
-                                                agtype_iterator *parent,
                                                 agtype_iterator* iterator);
 static agtype_parse_state *push_state(agtype_parse_state **pstate);
 static void append_key(agtype_parse_state *pstate, agtype_value *string);
@@ -1425,7 +1424,7 @@ void agtype_traversal_init(agtype_container *container, agtype_traversal* traver
 {
     Assert(traversal_entity != NULL);
     init_agtype_traversal(traversal_entity);
-    iterator_from_container(container, NULL, traversal_entity->it);
+    iterator_from_container(container, traversal_entity->it);
 }
 
 /*
@@ -1515,10 +1514,8 @@ recurse:
 
         if (!IS_A_AGTYPE_SCALAR(val) && !skip_nested)
         {
-            agtype_iterator* parent = traversal->it;
             /* Recurse into container. */
-            iterator_from_container(val->val.binary.data, parent,
-                                    prepare_next_iter(traversal));
+            iterator_from_container(val->val.binary.data, prepare_next_iter(traversal));
             goto recurse;
         }
         else
@@ -1597,9 +1594,7 @@ recurse:
          */
         if (!IS_A_AGTYPE_SCALAR(val) && !skip_nested)
         {
-            agtype_iterator* parent = traversal->it;
-            iterator_from_container(val->val.binary.data, parent,
-                                    prepare_next_iter(traversal));
+            iterator_from_container(val->val.binary.data, prepare_next_iter(traversal));
             goto recurse;
         }
         else
@@ -1616,11 +1611,9 @@ recurse:
  * Initialize an iterator for iterating all elements in a container.
  */
 static void iterator_from_container(agtype_container *container,
-                                                agtype_iterator *parent,
                                                 agtype_iterator* iterator)
 {
     iterator->container = container;
-    iterator->parent = parent;
     iterator->num_elems = AGTYPE_CONTAINER_SIZE(container);
 
     /* Array starts just after header */

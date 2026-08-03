@@ -10,8 +10,8 @@ void init_agi_stack(AgtypeIteratorStack *stack,
     stack->first.array = inline_array;
     stack->first.capacity = inline_capacity;
     stack->first.used = 0;
-    stack->first.owned = false;
     stack->first.prev = NULL;
+    stack->first.next = NULL;
 
     stack->top = &stack->first;
 }
@@ -19,19 +19,20 @@ void init_agi_stack(AgtypeIteratorStack *stack,
 
 void free_agi_stack(AgtypeIteratorStack *stack)
 {
-    AgtypeIteratorChunk *chunk = stack->top;
+    AgtypeIteratorChunk *chunk = stack->first.next;
 
-    while (chunk != &stack->first)
+    while (chunk != NULL)
     {
-        AgtypeIteratorChunk *prev = chunk->prev;
+        AgtypeIteratorChunk *next = chunk->next;
 
         pfree(chunk->array);
         pfree(chunk);
 
-        chunk = prev;
+        chunk = next;
     }
 
     stack->first.used = 0;
+    stack->first.next = NULL;
     stack->top = &stack->first;
 }
 
@@ -41,20 +42,26 @@ agtype_iterator *agi_stack_reserve_next(AgtypeIteratorStack *stack)
 
     if (chunk->used == chunk->capacity)
     {
-        AgtypeIteratorChunk *new_chunk = palloc(sizeof(*new_chunk));
+        if (chunk->next == NULL)
+        {
+            AgtypeIteratorChunk *next = palloc(sizeof(*next));
 
-        new_chunk->capacity =
-            Max(chunk->capacity * 2, AGI_STACK_INITIAL_CAPACITY);
+            next->capacity = Max(chunk->capacity * 2,
+                                 AGI_STACK_INITIAL_CAPACITY);
+            next->used = 0;
+            next->array =
+                palloc(sizeof(agtype_iterator) * next->capacity);
 
-        new_chunk->used = 0;
-        new_chunk->array =
-            palloc0(sizeof(agtype_iterator) * new_chunk->capacity);
+            next->prev = chunk;
+            next->next = NULL;
 
-        new_chunk->owned = true;
-        new_chunk->prev = chunk;
+            chunk->next = next;
+        }
 
-        stack->top = new_chunk;
-        chunk = new_chunk;
+        chunk = chunk->next;
+        chunk->used = 0;
+
+        stack->top = chunk;
     }
 
     return &chunk->array[chunk->used++];
@@ -68,14 +75,10 @@ void agi_stack_pop(AgtypeIteratorStack *stack)
 
     chunk->used--;
 
-    if (chunk->used == 0 && chunk != &stack->first)
-    {
+    if (chunk->used == 0 && chunk->prev != NULL)
         stack->top = chunk->prev;
-
-        pfree(chunk->array);
-        pfree(chunk);
-    }
 }
+
 agtype_iterator *agi_stack_peek(AgtypeIteratorStack *stack)
 {
     AgtypeIteratorChunk *chunk = stack->top;
@@ -88,9 +91,8 @@ agtype_iterator *agi_stack_peek(AgtypeIteratorStack *stack)
 
 bool agi_stack_is_empty(AgtypeIteratorStack *stack)
 {
-    AgtypeIteratorChunk *chunk = stack->top;
-
-    return chunk == NULL || (chunk->prev == NULL && chunk->used == 0);
+    return stack->top == &stack->first &&
+        stack->first.used == 0;
 }
 
 void init_agtype_traversal(agtype_traversal *traversal)
@@ -102,16 +104,14 @@ void init_agtype_traversal(agtype_traversal *traversal)
     traversal->it = agi_stack_reserve_next(&traversal->stack);
 }
 
-agtype_iterator* free_and_get_parent(agtype_traversal* traversal)
+agtype_iterator *free_and_get_parent(agtype_traversal *traversal)
 {
-    agtype_iterator* parent = traversal->it->parent;
+    agi_stack_pop(&traversal->stack);
 
-    if (!agi_stack_is_empty(&(traversal->stack)))
-    {
-        agi_stack_pop(&(traversal->stack));
-    }
+    if (agi_stack_is_empty(&traversal->stack))
+        return NULL;
 
-    return parent;
+    return agi_stack_peek(&traversal->stack);
 }
 
 agtype_iterator* prepare_next_iter(agtype_traversal* traversal)
