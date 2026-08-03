@@ -103,12 +103,11 @@ typedef struct agtype_type_cache
     int nargs;
 
     Oid *types;
-
-    /* Result of agtype_categorize_type() */
     agt_type_category *categories;
     Oid *outfuncoids;
-} agtype_type_cache;
 
+    MemoryContext tmp_ctx;
+} agtype_type_cache;
 
 static inline Datum agtype_from_cstring(char *str, int len);
 size_t check_string_length(size_t len);
@@ -2868,29 +2867,52 @@ Datum edge_to_jsonb(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(result);
 }
 
-static agtype_type_cache *
-get_type_cache(FunctionCallInfo fcinfo, int nargs, Oid *types)
+static agtype_type_cache *init_agtype_type_cache(FunctionCallInfo fcinfo)
+{
+
+    MemoryContext oldctx;
+    agtype_type_cache *cache;
+
+    oldctx = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+    cache = palloc(sizeof(agtype_type_cache));
+    
+    cache->nargs = 0;
+    cache->types = NULL;
+    cache->categories = NULL;
+    cache->outfuncoids = NULL;
+
+    cache->tmp_ctx =
+        AllocSetContextCreate(fcinfo->flinfo->fn_mcxt,
+                            "agtype_build_map tmp",
+                            ALLOCSET_DEFAULT_SIZES);
+
+    fcinfo->flinfo->fn_extra = cache;
+
+    MemoryContextSwitchTo(oldctx);
+
+    return cache;
+}
+
+static agtype_type_cache *get_type_cache(FunctionCallInfo fcinfo, int nargs, Oid *types)
 {
     FmgrInfo *flinfo = fcinfo->flinfo;
     agtype_type_cache *cache;
     MemoryContext oldctx;
     int i;
     bool rebuild = false;
-
+    
     cache = (agtype_type_cache *)flinfo->fn_extra;
 
-    if (cache == NULL)
+    Assert(cache != NULL);
+    if (cache->types == NULL)
     {
         oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
-
-        cache = palloc(sizeof(agtype_type_cache));
 
         cache->nargs = nargs;
         cache->types = palloc(sizeof(Oid) * nargs);
         cache->categories = palloc(sizeof(agt_type_category) * nargs);
         cache->outfuncoids = palloc(sizeof(Oid) * nargs);
-
-        flinfo->fn_extra = cache;
 
         MemoryContextSwitchTo(oldctx);
 
@@ -2916,8 +2938,6 @@ get_type_cache(FunctionCallInfo fcinfo, int nargs, Oid *types)
     {
         if (cache->nargs != nargs)
         {
-            oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
-
             cache->types =
                 repalloc(cache->types, sizeof(Oid) * nargs);
 
@@ -2930,8 +2950,6 @@ get_type_cache(FunctionCallInfo fcinfo, int nargs, Oid *types)
                          sizeof(Oid) * nargs);
 
             cache->nargs = nargs;
-
-            MemoryContextSwitchTo(oldctx);
         }
 
         for (i = 0; i < nargs; i++)
@@ -2969,12 +2987,13 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
     /* build argument values to build the object */
     nargs = extract_variadic_args(fcinfo, 0, true, &args, &types, &nulls);
 
-    cache = get_type_cache(fcinfo, nargs, types);
-    
     if (nargs < 0)
     {
         return NULL;
     }
+    
+    cache = get_type_cache(fcinfo, nargs, types);
+    
 
     if (nargs % 2 != 0)
     {
@@ -3058,21 +3077,34 @@ PG_FUNCTION_INFO_V1(agtype_build_map);
  */
 Datum agtype_build_map(PG_FUNCTION_ARGS)
 {
+    agtype_type_cache *cache;
+    MemoryContext oldctx;
     agtype_value *result = NULL;
     agtype *agt_result = NULL;
 
-    result = agtype_build_map_as_agtype_value(fcinfo);
-    if (result == NULL)
+    cache = (agtype_type_cache *) fcinfo->flinfo->fn_extra;
+
+    if (cache == NULL)
     {
-        PG_RETURN_NULL();
+        cache = init_agtype_type_cache(fcinfo);
     }
 
+    MemoryContextReset(cache->tmp_ctx);
+
+    oldctx = MemoryContextSwitchTo(cache->tmp_ctx);
+
+    result = agtype_build_map_as_agtype_value(fcinfo);
+
+    MemoryContextSwitchTo(oldctx);
+
+    if (result == NULL)
+        PG_RETURN_NULL();
+
     agt_result = agtype_value_to_agtype(result);
-    pfree_agtype_value(result);
+
 
     PG_RETURN_POINTER(agt_result);
 }
-
 PG_FUNCTION_INFO_V1(agtype_build_map_noargs);
 
 /*
@@ -3102,8 +3134,21 @@ PG_FUNCTION_INFO_V1(agtype_build_map_nonull);
  */
 Datum agtype_build_map_nonull(PG_FUNCTION_ARGS)
 {
+    agtype_type_cache *cache;
+    MemoryContext oldctx;
     agtype_value *result = NULL;
     agtype *agt_result;
+
+    cache = (agtype_type_cache *) fcinfo->flinfo->fn_extra;
+
+    if (cache == NULL)
+    {
+        cache = init_agtype_type_cache(fcinfo);
+    }
+
+    MemoryContextReset(cache->tmp_ctx);
+
+    oldctx = MemoryContextSwitchTo(cache->tmp_ctx);
 
     result = agtype_build_map_as_agtype_value(fcinfo);
     if (result == NULL)
@@ -3112,9 +3157,11 @@ Datum agtype_build_map_nonull(PG_FUNCTION_ARGS)
     }
 
     remove_null_from_agtype_object(result);
+
+    MemoryContextSwitchTo(oldctx);
+
     agt_result = agtype_value_to_agtype(result);
 
-    pfree_agtype_value(result);
 
     PG_RETURN_POINTER(agt_result);
 }
