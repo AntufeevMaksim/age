@@ -130,11 +130,11 @@ static void agtype_categorize_type(Oid typoid, agt_type_category *tcategory,
 static void composite_to_agtype(Datum composite, agtype_in_state *result);
 static void array_dim_to_agtype(agtype_in_state *result, int dim, int ndims,
                                 int *dims, Datum *vals, bool *nulls,
-                                int *valcount, agt_type_category tcategory,
-                                Oid outfuncoid);
+                                int *valcount, agt_type_category tcategory, Oid outfuncoid,
+                                Oid val_type);
 static void array_to_agtype_internal(Datum array, agtype_in_state *result);
 static void datum_to_agtype(Datum val, bool is_null, agtype_in_state *result,
-                            agt_type_category tcategory, Oid outfuncoid,
+                            agt_type_category tcategory, Oid outfuncoid, Oid val_type,
                             bool key_scalar);
 static char *agtype_to_cstring_worker(StringInfo out, agtype_container *in,
                                       int estimated_len, bool indent,
@@ -1565,7 +1565,7 @@ static void agtype_categorize_type(Oid typoid, agt_type_category *tcategory,
  * it's of an acceptable type, and force it to be a AGTV_STRING.
  */
 static void datum_to_agtype(Datum val, bool is_null, agtype_in_state *result,
-                            agt_type_category tcategory, Oid outfuncoid,
+                            agt_type_category tcategory, Oid outfuncoid, Oid val_type,
                             bool key_scalar)
 {
     char *outputstr;
@@ -1620,36 +1620,96 @@ static void datum_to_agtype(Datum val, bool is_null, agtype_in_state *result,
             }
             break;
         case AGT_TYPE_INTEGER:
-            outputstr = OidOutputFunctionCall(outfuncoid, val);
             if (key_scalar)
             {
+                outputstr = OidOutputFunctionCall(outfuncoid, val);
+
                 agtv.type = AGTV_STRING;
                 agtv.val.string.len = strlen(outputstr);
                 agtv.val.string.val = outputstr;
             }
             else
             {
-                Datum intd;
-
-                intd = DirectFunctionCall1(int8in, CStringGetDatum(outputstr));
                 agtv.type = AGTV_INTEGER;
-                agtv.val.int_value = DatumGetInt64(intd);
-                pfree_if_not_null(outputstr);
+
+                switch (val_type)
+                {
+                    case INT2OID:
+                        agtv.val.int_value = DatumGetInt16(val);
+                        break;
+
+                    case INT4OID:
+                        agtv.val.int_value = DatumGetInt32(val);
+                        break;
+
+                    case INT8OID:
+                        agtv.val.int_value = DatumGetInt64(val);
+                        break;
+
+                    default:
+                    {
+                        Datum intd;
+                        if (val_type == GRAPHIDOID)
+                        {
+                            agtv.val.int_value = DatumGetInt64(val);
+                        }
+                        else
+                        {
+                            /*
+                            * Safety fallback.
+                            */
+                            outputstr = OidOutputFunctionCall(outfuncoid, val);
+
+                            intd = DirectFunctionCall1(int8in,
+                                                    CStringGetDatum(outputstr));
+
+                            agtv.val.int_value = DatumGetInt64(intd);
+
+                            pfree_if_not_null(outputstr);
+                            break;
+                        }
+                    }
+                }
             }
             break;
         case AGT_TYPE_FLOAT:
-            outputstr = OidOutputFunctionCall(outfuncoid, val);
-            if (key_scalar)
-            {
-                agtv.type = AGTV_STRING;
-                agtv.val.string.len = strlen(outputstr);
-                agtv.val.string.val = outputstr;
-            }
-            else
-            {
+                if (key_scalar)
+                {
+                    outputstr = OidOutputFunctionCall(outfuncoid, val);
+
+                    agtv.type = AGTV_STRING;
+                    agtv.val.string.len = strlen(outputstr);
+                    agtv.val.string.val = outputstr;
+                }
+
                 agtv.type = AGTV_FLOAT;
-                agtv.val.float_value = DatumGetFloat8(val);
-            }
+                switch (val_type)
+                {
+                    case FLOAT4OID:
+                        agtv.val.float_value = DatumGetFloat4(val);
+                        break;
+
+                    case FLOAT8OID:
+                        agtv.val.float_value = DatumGetFloat8(val);
+                        break;
+
+                    default:
+                    {
+                        Datum d;
+                        /*
+                        * Safety fallback.
+                        */
+                        outputstr = OidOutputFunctionCall(outfuncoid, val);
+
+                        d = DirectFunctionCall1(float8in,
+                                                CStringGetDatum(outputstr));
+
+                        agtv.val.float_value = DatumGetFloat8(d);
+
+                        pfree(outputstr);
+                        break;
+                    }
+                }
             break;
         case AGT_TYPE_NUMERIC:
             outputstr = OidOutputFunctionCall(outfuncoid, val);
@@ -1841,8 +1901,7 @@ static void datum_to_agtype(Datum val, bool is_null, agtype_in_state *result,
  */
 static void array_dim_to_agtype(agtype_in_state *result, int dim, int ndims,
                                 int *dims, Datum *vals, bool *nulls,
-                                int *valcount, agt_type_category tcategory,
-                                Oid outfuncoid)
+                                int *valcount, agt_type_category tcategory, Oid outfuncoid, Oid val_type)
 {
     int i;
 
@@ -1856,13 +1915,13 @@ static void array_dim_to_agtype(agtype_in_state *result, int dim, int ndims,
         if (dim + 1 == ndims)
         {
             datum_to_agtype(vals[*valcount], nulls[*valcount], result,
-                            tcategory, outfuncoid, false);
+                            tcategory, outfuncoid, val_type, false);
             (*valcount)++;
         }
         else
         {
             array_dim_to_agtype(result, dim + 1, ndims, dims, vals, nulls,
-                                valcount, tcategory, outfuncoid);
+                                valcount, tcategory, outfuncoid, val_type);
         }
     }
 
@@ -1910,7 +1969,7 @@ static void array_to_agtype_internal(Datum array, agtype_in_state *result)
                       &nulls, &nitems);
 
     array_dim_to_agtype(result, 0, ndim, dim, elements, nulls, &count,
-                        tcategory, outfuncoid);
+                        tcategory, outfuncoid, element_type);
 
     pfree_if_not_null(elements);
     pfree_if_not_null(nulls);
@@ -1962,6 +2021,7 @@ static void composite_to_agtype(Datum composite, agtype_in_state *result)
         bool isnull;
         char *attname;
         agt_type_category tcategory;
+        Oid type_oid;
         Oid outfuncoid;
         agtype_value v;
         Form_pg_attribute att = TupleDescAttr(tupdesc, i);
@@ -1986,6 +2046,7 @@ static void composite_to_agtype(Datum composite, agtype_in_state *result)
         if (isnull)
         {
             tcategory = AGT_TYPE_NULL;
+            type_oid = InvalidOid;
             outfuncoid = InvalidOid;
         }
         else
@@ -1993,7 +2054,7 @@ static void composite_to_agtype(Datum composite, agtype_in_state *result)
             agtype_categorize_type(att->atttypid, &tcategory, &outfuncoid);
         }
 
-        datum_to_agtype(val, isnull, result, tcategory, outfuncoid, false);
+        datum_to_agtype(val, isnull, result, tcategory, outfuncoid, type_oid, false);
     }
 
     result->res = push_agtype_value(&result->parse_state, WAGT_END_OBJECT,
@@ -2064,7 +2125,7 @@ void add_agtype(Datum val, bool is_null, agtype_in_state *result,
         agtype_categorize_type(val_type, &tcategory, &outfuncoid);
     }
 
-    datum_to_agtype(val, is_null, result, tcategory, outfuncoid, key_scalar);
+    datum_to_agtype(val, is_null, result, tcategory, outfuncoid, val_type, key_scalar);
 }
 
 agtype_value *string_to_agtype_value(char *s)
@@ -3050,6 +3111,7 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
                             &result,
                             cache->categories[i],
                             cache->outfuncoids[i],
+                            cache->types[i],
                             true);
         }
 
@@ -3063,6 +3125,9 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
                         nulls[i + 1]
                             ? InvalidOid
                             : cache->outfuncoids[i + 1],
+                        nulls[i + 1]
+                            ? InvalidOid
+                            : cache->types[i + 1],                        
                         false);
     }
 
@@ -11481,7 +11546,7 @@ agtype *get_one_agtype_from_variadic_args(FunctionCallInfo fcinfo,
         /* get the category for the datum */
         agtype_categorize_type(types[0], &tcategory, &outfuncoid);
         /* convert it to an agtype_value */
-        datum_to_agtype(args[0], false, &state, tcategory, outfuncoid, false);
+        datum_to_agtype(args[0], false, &state, tcategory, outfuncoid, types[0], false);
         /* convert it to an agtype */
         agtype_result = agtype_value_to_agtype(state.res);
 
