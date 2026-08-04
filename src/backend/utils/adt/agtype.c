@@ -64,6 +64,8 @@
 #include "catalog/ag_graph.h"
 #include "catalog/ag_label.h"
 #include "utils/ag_func.h"
+#include "common/hashfn.h"
+
 
 /* State structure for Percentile aggregate functions */
 typedef struct PercentileGroupAggState
@@ -98,16 +100,59 @@ typedef enum /* type categories for datum_to_agtype */
     AGT_TYPE_OTHER /* all else */
 } agt_type_category;
 
-typedef struct agtype_type_cache
-{
-    int nargs;
+#include "lib/simplehash.h"
 
-    Oid *types;
-    agt_type_category *categories;
-    Oid *outfuncoids;
+typedef struct ArgType
+{
+    Oid type_oid;
+    Datum value;
+    bool is_null;
+} ArgType;
+
+
+typedef struct TypeInfo
+{
+    Oid oid;
+    agt_type_category category;
+    Oid outfuncoid;
+    uint32      hash_value;
+    char        status;
+} TypeInfo;
+
+#define SH_PREFIX type_cache
+#define SH_ELEMENT_TYPE TypeInfo
+#define SH_KEY_TYPE Oid
+#define SH_KEY oid
+#define SH_EQUAL(tb, a, b) (a == b)
+#define SH_HASH_KEY(tb, key) hash_uint32((uint32) key)
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a) (a)->hash_value
+#define SH_SCOPE static __attribute__((unused))
+
+#define SH_DECLARE
+#include "lib/simplehash.h"
+
+
+#define SH_PREFIX type_cache
+#define SH_ELEMENT_TYPE TypeInfo
+#define SH_KEY_TYPE Oid
+#define SH_KEY oid
+#define SH_EQUAL(tb, a, b) (a == b)
+#define SH_HASH_KEY(tb, key) hash_uint32((uint32) key)
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a) (a)->hash_value
+#define SH_SCOPE static __attribute__((unused))
+
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+typedef struct
+{
+    type_cache_hash* type_cache;
 
     MemoryContext tmp_ctx;
-} agtype_type_cache;
+
+} agtype_build_map_cache;
 
 static inline Datum agtype_from_cstring(char *str, int len);
 size_t check_string_length(size_t len);
@@ -2928,25 +2973,23 @@ Datum edge_to_jsonb(PG_FUNCTION_ARGS)
     PG_RETURN_DATUM(result);
 }
 
-static agtype_type_cache *init_agtype_type_cache(FunctionCallInfo fcinfo)
+static agtype_build_map_cache *
+init_agtype_type_cache(FunctionCallInfo fcinfo)
 {
-
     MemoryContext oldctx;
-    agtype_type_cache *cache;
+    agtype_build_map_cache *cache;
 
     oldctx = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
 
-    cache = palloc(sizeof(agtype_type_cache));
-    
-    cache->nargs = 0;
-    cache->types = NULL;
-    cache->categories = NULL;
-    cache->outfuncoids = NULL;
+    cache = palloc(sizeof(agtype_build_map_cache));
+
+    cache->type_cache =
+        type_cache_create(fcinfo->flinfo->fn_mcxt, 8, NULL);
 
     cache->tmp_ctx =
         AllocSetContextCreate(fcinfo->flinfo->fn_mcxt,
-                            "agtype_build_map tmp",
-                            ALLOCSET_DEFAULT_SIZES);
+                              "agtype_build_map tmp",
+                              ALLOCSET_DEFAULT_SIZES);
 
     fcinfo->flinfo->fn_extra = cache;
 
@@ -2955,83 +2998,79 @@ static agtype_type_cache *init_agtype_type_cache(FunctionCallInfo fcinfo)
     return cache;
 }
 
-static agtype_type_cache *get_type_cache(FunctionCallInfo fcinfo, int nargs, Oid *types)
+static TypeInfo *
+get_type_cache(FunctionCallInfo fcinfo, Oid type)
 {
-    FmgrInfo *flinfo = fcinfo->flinfo;
-    agtype_type_cache *cache;
     MemoryContext oldctx;
-    int i;
-    bool rebuild = false;
-    
-    cache = (agtype_type_cache *)flinfo->fn_extra;
+    agtype_build_map_cache *cache;
+    TypeInfo *entry;
+    bool found;
 
-    Assert(cache != NULL);
-    if (cache->types == NULL)
+    cache = (agtype_build_map_cache *) fcinfo->flinfo->fn_extra;
+
+    entry =
+        type_cache_lookup(cache->type_cache,
+                                type);
+
+    if (entry != NULL)
     {
-        oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
-
-        cache->nargs = nargs;
-        cache->types = palloc(sizeof(Oid) * nargs);
-        cache->categories = palloc(sizeof(agt_type_category) * nargs);
-        cache->outfuncoids = palloc(sizeof(Oid) * nargs);
-
-        MemoryContextSwitchTo(oldctx);
-
-        rebuild = true;
+        return entry;
     }
-    else if (cache->nargs != nargs)
+
+
+    /*
+     * Type was not cached.
+     * Insert new entry.
+     */
+    oldctx = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+    entry =
+        type_cache_insert(cache->type_cache,
+                                type,
+                                &found);
+
+    MemoryContextSwitchTo(oldctx);
+    Assert(!found);
+
+    entry->oid = type;
+
+
+    if (type == InvalidOid)
     {
-        rebuild = true;
+        entry->category = AGT_TYPE_NULL;
+        entry->outfuncoid = InvalidOid;
     }
     else
     {
-        for (i = 0; i < nargs; i++)
-        {
-            if (cache->types[i] != types[i])
-            {
-                rebuild = true;
-                break;
-            }
-        }
+        agtype_categorize_type(type,
+                               &entry->category,
+                               &entry->outfuncoid);
     }
 
-    if (rebuild)
+    return entry;
+}
+
+static inline void get_arg_info(ArgType *arg,
+                                        FunctionCallInfo fcinfo, 
+                                        Datum* args,
+                                        bool* nulls,
+                                        Oid* types,
+                                        int idx,
+                                        bool is_variadic)
+{
+    if (!is_variadic)
     {
-        if (cache->nargs != nargs)
-        {
-            cache->types =
-                repalloc(cache->types, sizeof(Oid) * nargs);
-
-            cache->categories =
-                repalloc(cache->categories,
-                         sizeof(agt_type_category) * nargs);
-
-            cache->outfuncoids =
-                repalloc(cache->outfuncoids,
-                         sizeof(Oid) * nargs);
-
-            cache->nargs = nargs;
-        }
-
-        for (i = 0; i < nargs; i++)
-        {
-            cache->types[i] = types[i];
-
-            if (types[i] == InvalidOid)
-            {
-                cache->categories[i] = AGT_TYPE_NULL;
-                cache->outfuncoids[i] = InvalidOid;
-            }
-            else
-            {
-                agtype_categorize_type(types[i],
-                                       &cache->categories[i],
-                                       &cache->outfuncoids[i]);
-            }
-        }
+        arg->value = fcinfo->args[idx].value;
+        arg->is_null = fcinfo->args[idx].isnull;
+        arg->type_oid = get_fn_expr_argtype(fcinfo->flinfo, idx);
+    }
+    else
+    {
+        arg->value = args[idx];
+        arg->is_null = nulls[idx];
+        arg->type_oid = types[idx];
     }
 
-    return cache;
 }
 
 static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
@@ -3042,18 +3081,23 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
     Datum *args;
     bool *nulls;
     Oid *types;
-    agtype_type_cache *cache;
+    
+    bool is_expr_variadic = get_fn_expr_variadic(fcinfo->flinfo);
 
-
-    /* build argument values to build the object */
-    nargs = extract_variadic_args(fcinfo, 0, true, &args, &types, &nulls);
+    if (!is_expr_variadic)
+    {
+        nargs = fcinfo->nargs;
+    }
+    else
+    {
+        /* build argument values to build the object */
+        nargs = extract_variadic_args(fcinfo, 0, true, &args, &types, &nulls);
+    }
 
     if (nargs < 0)
     {
         return NULL;
     }
-    
-    cache = get_type_cache(fcinfo, nargs, types);
     
 
     if (nargs % 2 != 0)
@@ -3061,41 +3105,47 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
         ereport(
             ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-             errmsg("argument list must have been even number of elements"),
-             errhint("The arguments of agtype_build_map() must consist of alternating keys and values.")));
+            errmsg("argument list must have been even number of elements"),
+            errhint("The arguments of agtype_build_map() must consist of alternating keys and values.")));
     }
 
     memset(&result, 0, sizeof(agtype_in_state));
 
     result.res = push_agtype_value(&result.parse_state, WAGT_BEGIN_OBJECT,
-                                   NULL);
+                                NULL);
 
     /* iterate through the arguments and build the object */
     for (i = 0; i < nargs; i += 2)
     {
+        TypeInfo* type_info;
+        ArgType arg_info;
+
+        get_arg_info(&arg_info, fcinfo, args, nulls, types, i, is_expr_variadic);
+        type_info = get_type_cache(fcinfo, arg_info.type_oid);
+
         /* process key */
-        if (nulls[i])
+        if (arg_info.is_null)
         {
             ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("argument %d: key must not be null", i + 1)));
+                    errmsg("argument %d: key must not be null", i + 1)));
         }
 
         /*
-         * If the key is agtype, we need to extract it as an agtype string and
-         * push the value.
-         */
-        if (types[i] == AGTYPEOID)
+        * If the key is agtype, we need to extract it as an agtype string and
+        * push the value.
+        */
+        if (arg_info.type_oid == AGTYPEOID)
         {
             agtype_value *agtv = NULL;
 
-            agtv = tostring_helper(args[i], types[i],
-                                   "agtype_build_map_as_agtype_value");
+            agtv = tostring_helper(arg_info.value, arg_info.type_oid,
+                                "agtype_build_map_as_agtype_value");
             if (agtv == NULL)
             {
                 ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                     errmsg("argument %d: key must not be null", i + 1)));
+                    errmsg("argument %d: key must not be null", i + 1)));
 
             }
 
@@ -3106,28 +3156,29 @@ static agtype_value *agtype_build_map_as_agtype_value(FunctionCallInfo fcinfo)
         }
         else
         {
-            datum_to_agtype(args[i],
+            datum_to_agtype(arg_info.value,
                             false,
                             &result,
-                            cache->categories[i],
-                            cache->outfuncoids[i],
-                            cache->types[i],
+                            type_info->category,
+                            type_info->outfuncoid,
+                            type_info->oid,
                             true);
         }
-
-        /* process value */
-        datum_to_agtype(args[i + 1],
-                        nulls[i + 1],
+        get_arg_info(&arg_info, fcinfo, args, nulls, types, i + 1, is_expr_variadic);
+        type_info = get_type_cache(fcinfo, arg_info.type_oid);
+        
+        datum_to_agtype(arg_info.value,
+                        arg_info.is_null,
                         &result,
-                        nulls[i + 1]
+                        arg_info.is_null
                             ? AGT_TYPE_NULL
-                            : cache->categories[i + 1],
-                        nulls[i + 1]
+                            : type_info->category,
+                        arg_info.is_null
                             ? InvalidOid
-                            : cache->outfuncoids[i + 1],
-                        nulls[i + 1]
+                            : type_info->outfuncoid,
+                        arg_info.is_null
                             ? InvalidOid
-                            : cache->types[i + 1],                        
+                            : type_info->oid,                 
                         false);
     }
 
@@ -3142,12 +3193,12 @@ PG_FUNCTION_INFO_V1(agtype_build_map);
  */
 Datum agtype_build_map(PG_FUNCTION_ARGS)
 {
-    agtype_type_cache *cache;
+    agtype_build_map_cache *cache;
     MemoryContext oldctx;
     agtype_value *result = NULL;
     agtype *agt_result = NULL;
 
-    cache = (agtype_type_cache *) fcinfo->flinfo->fn_extra;
+    cache = (agtype_build_map_cache *) fcinfo->flinfo->fn_extra;
 
     if (cache == NULL)
     {
@@ -3199,12 +3250,12 @@ PG_FUNCTION_INFO_V1(agtype_build_map_nonull);
  */
 Datum agtype_build_map_nonull(PG_FUNCTION_ARGS)
 {
-    agtype_type_cache *cache;
+    agtype_build_map_cache *cache;
     MemoryContext oldctx;
     agtype_value *result = NULL;
     agtype *agt_result;
 
-    cache = (agtype_type_cache *) fcinfo->flinfo->fn_extra;
+    cache = (agtype_build_map_cache *) fcinfo->flinfo->fn_extra;
 
     if (cache == NULL)
     {
