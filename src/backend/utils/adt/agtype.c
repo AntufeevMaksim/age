@@ -64,6 +64,8 @@
 #include "catalog/ag_graph.h"
 #include "catalog/ag_label.h"
 #include "utils/ag_func.h"
+#include "common/hashfn.h"
+
 
 /* State structure for Percentile aggregate functions */
 typedef struct PercentileGroupAggState
@@ -97,6 +99,60 @@ typedef enum /* type categories for datum_to_agtype */
     AGT_TYPE_VERTEX,
     AGT_TYPE_OTHER /* all else */
 } agt_type_category;
+
+#include "lib/simplehash.h"
+
+typedef struct ArgType
+{
+    Oid type_oid;
+    Datum value;
+    bool is_null;
+} ArgType;
+
+
+typedef struct TypeInfo
+{
+    Oid oid;
+    agt_type_category category;
+    Oid outfuncoid;
+    uint32      hash_value;
+    char        status;
+} TypeInfo;
+
+#define SH_PREFIX type_cache
+#define SH_ELEMENT_TYPE TypeInfo
+#define SH_KEY_TYPE Oid
+#define SH_KEY oid
+#define SH_EQUAL(tb, a, b) (a == b)
+#define SH_HASH_KEY(tb, key) hash_uint32((uint32) key)
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a) (a)->hash_value
+#define SH_SCOPE static __attribute__((unused))
+
+#define SH_DECLARE
+#include "lib/simplehash.h"
+
+
+#define SH_PREFIX type_cache
+#define SH_ELEMENT_TYPE TypeInfo
+#define SH_KEY_TYPE Oid
+#define SH_KEY oid
+#define SH_EQUAL(tb, a, b) (a == b)
+#define SH_HASH_KEY(tb, key) hash_uint32((uint32) key)
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a) (a)->hash_value
+#define SH_SCOPE static __attribute__((unused))
+
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+typedef struct
+{
+    type_cache_hash* type_cache;
+
+    MemoryContext tmp_ctx;
+
+} agtype_build_map_cache;
 
 static inline Datum agtype_from_cstring(char *str, int len);
 size_t check_string_length(size_t len);
@@ -4479,168 +4535,130 @@ Datum agtype_array_element_text(PG_FUNCTION_ARGS)
     PG_RETURN_TEXT_P((const void*) retval);
 }
 
-PG_FUNCTION_INFO_V1(agtype_access_operator);
-/*
- * Execution function for object.property, object["property"],
- * and array[element]
- */
-Datum agtype_access_operator(PG_FUNCTION_ARGS)
+static agtype_build_map_cache *
+init_agtype_type_cache(FunctionCallInfo fcinfo)
 {
-    Datum *args = NULL;
-    bool *nulls = NULL;
-    Oid *types = NULL;
-    int nargs = 0;
+    MemoryContext oldctx;
+    agtype_build_map_cache *cache;
+
+    oldctx = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+    cache = palloc(sizeof(agtype_build_map_cache));
+
+    cache->type_cache =
+        type_cache_create(fcinfo->flinfo->fn_mcxt, 8, NULL);
+
+    cache->tmp_ctx =
+        AllocSetContextCreate(fcinfo->flinfo->fn_mcxt,
+                              "agtype_build_map tmp",
+                              ALLOCSET_DEFAULT_SIZES);
+
+    fcinfo->flinfo->fn_extra = cache;
+
+    MemoryContextSwitchTo(oldctx);
+
+    return cache;
+}
+
+static TypeInfo *
+get_type_cache(FunctionCallInfo fcinfo, Oid type)
+{
+    MemoryContext oldctx;
+    agtype_build_map_cache *cache;
+    TypeInfo *entry;
+    bool found;
+
+    cache = (agtype_build_map_cache *) fcinfo->flinfo->fn_extra;
+
+    entry =
+        type_cache_lookup(cache->type_cache,
+                                type);
+
+    if (entry != NULL)
+    {
+        return entry;
+    }
+
+
+    /*
+     * Type was not cached.
+     * Insert new entry.
+     */
+    oldctx = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+    entry =
+        type_cache_insert(cache->type_cache,
+                                type,
+                                &found);
+
+    MemoryContextSwitchTo(oldctx);
+    Assert(!found);
+
+    entry->oid = type;
+
+
+    if (type == InvalidOid)
+    {
+        entry->category = AGT_TYPE_NULL;
+        entry->outfuncoid = InvalidOid;
+    }
+    else
+    {
+        agtype_categorize_type(type,
+                               &entry->category,
+                               &entry->outfuncoid);
+    }
+
+    return entry;
+}
+
+
+static agtype *
+get_agtype_arg(FunctionCallInfo fcinfo, Oid type, Datum datum)
+{
+    TypeInfo* type_info;
+    agtype_in_state state;
+
+    if (type == AGTYPEOID)
+        return DATUM_GET_AGTYPE_P(datum);
+
+
+    Oid outfunc;
+    bool isvarlena;
+    char *str;
+    Datum d;
+
+    getTypeOutputInfo(type, &outfunc, &isvarlena);
+
+    str = OidOutputFunctionCall(outfunc, datum);
+
+    d = agtype_from_cstring(str, strlen(str));
+
+    pfree(str);
+
+    return DATUM_GET_AGTYPE_P(d);
+    // memset(&state, 0, sizeof(state));
+
+
+    // type_info = get_type_cache(fcinfo, type);
+
+    // datum_to_agtype(datum, false, &state, type_info->category, type_info->outfuncoid, false);
+
+    // return agtype_value_to_agtype(state.res);
+}
+
+static agtype_value *
+agtype_access_operator_impl(FunctionCallInfo fcinfo,
+                            int nargs,
+                            Datum *args)
+{
+    int i;
     agtype *container = NULL;
     agtype_value *container_value = NULL;
-    agtype *result = NULL;
-    int i = 0;
 
-    /*
-     * Fast path for the common 2-argument case (object.property or
-     * array[index]). Avoids extract_variadic_args overhead which
-     * includes exprType, get_call_expr_argtype, and memory allocation
-     * on every call.
-     */
-    if (PG_NARGS() == 2)
-    {
-        agtype *key = NULL;
-
-        /* check for NULLs */
-        if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-        {
-            PG_RETURN_NULL();
-        }
-
-        /* get the container argument */
-        container = DATUM_GET_AGTYPE_P(PG_GETARG_DATUM(0));
-
-        /* handle binary container (VLE vpc) */
-        if (AGT_ROOT_IS_BINARY(container))
-        {
-            if (AGT_ROOT_BINARY_FLAGS(container) == AGT_FBINARY_TYPE_VLE_PATH)
-            {
-                container_value = agtv_materialize_vle_edges(container);
-                container = NULL;
-            }
-            else
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("binary container must be a VLE vpc")));
-            }
-        }
-        /* handle scalar (vertex or edge) */
-        else if (AGT_ROOT_IS_SCALAR(container))
-        {
-            container_value = get_ith_agtype_value_from_container(
-                                  &container->root, 0);
-            if (container_value->type != AGTV_EDGE &&
-                container_value->type != AGTV_VERTEX)
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("scalar object must be a vertex or edge")));
-            }
-            container = NULL;
-        }
-
-        /* get the key */
-        key = DATUM_GET_AGTYPE_P(PG_GETARG_DATUM(1));
-
-        if (!(AGT_ROOT_IS_SCALAR(key)))
-        {
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                            errmsg("key must resolve to a scalar value")));
-        }
-
-        /* extract properties from vertex/edge */
-        if (container_value != NULL &&
-            (container_value->type == AGTV_EDGE ||
-             container_value->type == AGTV_VERTEX))
-        {
-            container_value = (container_value->type == AGTV_EDGE)
-                ? &container_value->val.object.pairs[4].value
-                : &container_value->val.object.pairs[2].value;
-        }
-
-        /* map access */
-        if ((container_value != NULL &&
-             (container_value->type == AGTV_OBJECT ||
-              (container_value->type == AGTV_BINARY &&
-               AGTYPE_CONTAINER_IS_OBJECT(container_value->val.binary.data)))) ||
-            (container != NULL && AGT_ROOT_IS_OBJECT(container)))
-        {
-            container_value = execute_map_access_operator(container,
-                                                          container_value, key);
-        }
-        /* array access */
-        else if ((container_value != NULL &&
-                  (container_value->type == AGTV_ARRAY ||
-                   (container_value->type == AGTV_BINARY &&
-                    AGTYPE_CONTAINER_IS_ARRAY(container_value->val.binary.data)))) ||
-                 (container != NULL && AGT_ROOT_IS_ARRAY(container)))
-        {
-            container_value = execute_array_access_operator(container,
-                                                            container_value,
-                                                            key);
-        }
-        else
-        {
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                            errmsg("container must be an array or object")));
-        }
-
-        if (container_value == NULL || container_value->type == AGTV_NULL)
-        {
-            PG_RETURN_NULL();
-        }
-
-        result = agtype_value_to_agtype(container_value);
-        return AGTYPE_P_GET_DATUM(result);
-    }
-
-    /*
-     * Standard variadic path for 3+ arguments (chained access like a.b.c)
-     * or edge cases.
-     */
-
-    /* extract our args, we need at least 2 */
-    nargs = extract_variadic_args_min(fcinfo, 0, true, &args, &types, &nulls,
-                                      2);
-    /*
-     * Return NULL if -
-     *
-     *     1) Our args are all null - nothing passed at all.
-     *     2) We don't have the minimum number of args. We require an object or
-     *        an array along with either a key or element number. Note that the
-     *        function extract_variadic_args_min will return 0 (nargs) if we
-     *        don't have at least 2 args.
-     *
-     */
-    if (args == NULL || nargs == 0 || nulls[0] == true)
-    {
-        pfree_if_not_null(args);
-        pfree_if_not_null(types);
-        pfree_if_not_null(nulls);
-
-        PG_RETURN_NULL();
-    }
-
-    /* check for individual NULLs */
-    for (i = 0; i < nargs; i++)
-    {
-        /* if we have a NULL, return NULL */
-        if (nulls[i] == true)
-        {
-            pfree_if_not_null(args);
-            pfree_if_not_null(types);
-            pfree_if_not_null(nulls);
-            PG_RETURN_NULL();
-        }
-    }
 
     /* get the container argument. It could be an object or array */
-    container = DATUM_GET_AGTYPE_P(args[0]);
+    container = get_agtype_arg(fcinfo, get_fn_expr_argtype(fcinfo->flinfo, 0), args[0]);
 
     /* if it is a binary container, check for a VLE vpc */
     if (AGT_ROOT_IS_BINARY(container))
@@ -4678,13 +4696,12 @@ Datum agtype_access_operator(PG_FUNCTION_ARGS)
         container = NULL;
     }
 
-    /* iterate through the keys (object fields or array elements) */
     for (i = 1; i < nargs; i++)
     {
         agtype *key = NULL;
 
         /* get the key */
-        key = DATUM_GET_AGTYPE_P(args[i]);
+        key = get_agtype_arg(fcinfo, get_fn_expr_argtype(fcinfo->flinfo, i), args[i]);
 
         /* the key must be a scalar */
         if (!(AGT_ROOT_IS_SCALAR(key)))
@@ -4746,22 +4763,116 @@ Datum agtype_access_operator(PG_FUNCTION_ARGS)
         /* for NULL values return NULL */
         if (container_value == NULL || container_value->type == AGTV_NULL)
         {
-            PG_RETURN_NULL();
+            return NULL;
         }
 
         /* clear the container reference */
         container = NULL;
     }
+    return container_value;
+    
+}
 
-    pfree_if_not_null(args);
-    pfree_if_not_null(types);
-    pfree_if_not_null(nulls);
 
+PG_FUNCTION_INFO_V1(agtype_access_operator);
+/*
+ * Execution function for object.property, object["property"],
+ * and array[element]
+ */
+Datum agtype_access_operator(PG_FUNCTION_ARGS)
+{
+    agtype_build_map_cache *cache;
+    int i;
+    int nargs;
+    agtype *result;
+    agtype_value *container_value;
+    
+    cache = (agtype_build_map_cache *) fcinfo->flinfo->fn_extra;
+
+    if (cache == NULL)
+    {
+        cache = init_agtype_type_cache(fcinfo);
+    }
+
+    nargs = PG_NARGS();
+
+    if (!get_fn_expr_variadic(fcinfo->flinfo))
+    {
+        Datum args_local[FUNC_MAX_ARGS];
+
+
+        for (i = 0; i < nargs; i++)
+        {
+            args_local[i] = PG_GETARG_DATUM(i);
+            if (PG_ARGISNULL(i))
+            {
+                PG_RETURN_NULL();
+            }
+        }
+
+        container_value = agtype_access_operator_impl(fcinfo, nargs, args_local);
+    }
+
+    else
+    {
+        Datum *args = NULL;
+        bool *nulls = NULL;
+        Oid *types = NULL;
+
+        nargs = extract_variadic_args_min(fcinfo, 0, true, &args, &types, &nulls, 2);
+
+        /*
+        * Return NULL if -
+        *
+        *     1) Our args are all null - nothing passed at all.
+        *     2) We don't have the minimum number of args. We require an object or
+        *        an array along with either a key or element number. Note that the
+        *        function extract_variadic_args_min will return 0 (nargs) if we
+        *        don't have at least 2 args.
+        *
+        */
+        if (args == NULL || nargs == 0 || nulls[0] == true)
+        {
+            pfree_if_not_null(args);
+            pfree_if_not_null(types);
+            pfree_if_not_null(nulls);
+
+            PG_RETURN_NULL();
+        }
+
+        /* check for individual NULLs */
+        for (i = 0; i < nargs; i++)
+        {
+            /* if we have a NULL, return NULL */
+            if (nulls[i] == true)
+            {
+                pfree_if_not_null(args);
+                pfree_if_not_null(types);
+                pfree_if_not_null(nulls);
+                PG_RETURN_NULL();
+            }
+        }
+        
+        container_value = agtype_access_operator_impl(fcinfo, nargs, args);
+
+        pfree_if_not_null(args);
+        pfree_if_not_null(types);
+        pfree_if_not_null(nulls);
+    }
+
+
+    if (container_value == NULL)
+    {
+        PG_RETURN_NULL();
+    }
+    
     /* serialize and return the result */
     result = agtype_value_to_agtype(container_value);
 
     return AGTYPE_P_GET_DATUM(result);
+
 }
+
 
 PG_FUNCTION_INFO_V1(agtype_access_slice);
 /*
